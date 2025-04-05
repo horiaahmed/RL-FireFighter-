@@ -1,12 +1,48 @@
-import tensorflow as tf
 import numpy as np
 import random
 import tkinter as tk
-from Fire_Fighter_Env import FireFighterEnv, FireGameUI  
-from Fire_Fighter_Env import FireFighterEnv
+import torch
+from torch.distributions import Categorical
+from Fire_Fighter_Env import FireFighterEnv, FireGameUI  # Assuming these are unchanged
 
-# Load the policy model and the trained weights
-model = tf.keras.models.load_model("Best_PG_Model.keras")
+# Load the PyTorch policy model
+class PolicyNetwork(torch.nn.Module):
+    def init(self, input_size, hidden_size, output_size):
+        super(PolicyNetwork, self).init()
+        self.network = torch.nn.Sequential(
+            torch.nn.Linear(input_size, hidden_size),
+            torch.nn.ReLU(),
+            torch.nn.Linear(hidden_size, hidden_size),
+            torch.nn.ReLU(),
+            torch.nn.Linear(hidden_size, output_size),
+            torch.nn.Softmax(dim=-1)
+        )
+    
+    def forward(self, x):
+        return self.network(x)
+
+# Load the trained weights
+model = PolicyNetwork(input_size=6, hidden_size=512, output_size=4)  # Match training architecture
+model.load_state_dict(torch.load("best_policy.pt"))
+model.eval()
+
+# Function to convert state to tensor (from your PolicyGradientAgent)
+def state_to_tensor(state_dict, size=9, max_steps=200):
+    fire_locs = np.argwhere(state_dict['grid'] == 2)  # FIRE = 2 from CellType
+    if len(fire_locs) > 0:
+        agent_x, agent_y = state_dict['agent_pos']
+        distances = np.sqrt(((fire_locs - [agent_x, agent_y])**2).sum(axis=1))
+        nearest_idx = np.argmin(distances)
+        nearest_fire_pos = fire_locs[nearest_idx]
+    else:
+        nearest_fire_pos = state_dict['agent_pos']
+    
+    agent_pos = torch.FloatTensor(state_dict['agent_pos']) / size
+    fire_pos = torch.FloatTensor(nearest_fire_pos) / size
+    steps_left = torch.FloatTensor([state_dict['steps_left'] / max_steps])
+    score = torch.FloatTensor([state_dict['score'] / 1000.0])
+    
+    return torch.cat([agent_pos, fire_pos, steps_left, score]).unsqueeze(0)
 
 # Initialize the environment
 env = FireFighterEnv(size=9, fire_spawn_delay=10, max_steps=200)
@@ -17,74 +53,34 @@ ui = FireGameUI(root, env)
 
 # Initialize state and done flag
 state = env.reset()
-state = state['grid']
 done = False
-
-# Define hyperparameters for Policy Gradient
-epsilon = 0.5  # Exploration factor (for action sampling)
-gamma = 0.99  # Discount factor
-rewards_history = []  # Store rewards for backpropagation
-states_history = []  # Store states for backpropagation
-actions_history = []  # Store actions for backpropagation
+total_reward = 0
 
 def run_episode():
-    global state, done, rewards_history, states_history, actions_history
+    global state, done, total_reward
     if not done:
-        # Sample an action from the policy (based on the softmax output of the model)
-        action_probs = model.predict(np.expand_dims(state, axis=0), verbose=0)  # Output is probabilities for each action
-        action = np.random.choice(len(action_probs[0]), p=action_probs[0])  # Sample action based on probabilities
+        # Sample an action from the policy
+        state_tensor = state_to_tensor(state)
+        with torch.no_grad():
+            action_probs = model(state_tensor)  # Output is probabilities for each action
+            m = Categorical(action_probs)
+            action = m.sample().item()  # Sample action based on probabilities
 
         # Take a step in the environment
         next_state, reward, done, _ = env.step(action)
-        next_state = next_state['grid']
-
-        # Store the rewards, actions, and states for policy gradient updates
-        rewards_history.append(reward)
-        actions_history.append(action)
-        states_history.append(state)
+        total_reward += reward
 
         state = next_state
         ui.render(action)
 
-    # If the episode is done, update the policy using the collected rewards and states
+    # If episode ends, print total reward and reset
     if done:
-        # Compute returns (discounted sum of future rewards)
-        returns = []
-        discounted_reward = 0
-        for reward in reversed(rewards_history):
-            discounted_reward = reward + gamma * discounted_reward
-            returns.insert(0, discounted_reward)
+        print(f"Episode completed with total reward: {total_reward}")
+        state = env.reset()
+        total_reward = 0
+        done = False
 
-        # Normalize the returns for stability
-        returns = np.array(returns)
-        returns = (returns - np.mean(returns)) / (np.std(returns) + 1e-7)
-
-        # Perform a policy update (typically using a loss function like categorical cross-entropy)
-        actions_history = np.array(actions_history)
-        states_history = np.array(states_history)
-        returns = np.array(returns)
-
-        # Train the model (policy gradient step)
-        with tf.GradientTape() as tape:
-            # Compute probabilities for the taken actions
-            action_probs = model(states_history)
-            action_probs = tf.gather(action_probs, actions_history, axis=1, batch_dims=1)
-            # Compute the loss (negative log likelihood of the chosen actions weighted by the returns)
-            loss = -tf.reduce_mean(tf.math.log(action_probs) * returns)
-
-        # Calculate gradients and apply them to the model
-        grads = tape.gradient(loss, model.trainable_variables)
-        optimizer = tf.keras.optimizers.Adam(learning_rate=0.01)
-        optimizer.apply_gradients(zip(grads, model.trainable_variables))
-
-        # Reset the histories after the update
-        rewards_history = []
-        states_history = []
-        actions_history = []
-
-        print(f"Episode completed with total reward: {sum(rewards_history)}")
-
-    # Schedule the next step of the game
+    # Schedule the next step
     root.after(1000, run_episode)
 
 # Start the first episode
